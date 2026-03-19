@@ -1,0 +1,6 @@
+#A ideia desse código é facilitar o processo de crítica dos planos de manutenção pelo ZBS.
+#Criar uma base de dados com todos os planos de manutenção planejados e efetivamente executados nos últimos 5 anos na cervejaria do Vale. 
+#Inserir o plano de manutenção para o ano seguinte.
+#O código deve, primeiramente, avaliar se todas as ordens de trabalho estão completas e acusar caso falte alguma informação.
+#O código deve, então, repassar cada uma das ordens de manutenção do próximo ano com o histórico, flaggando manutenções que estariam sendo feitas pela primeira vez e manutenções que foram planejadas, mas não executadas nos últimos três anos. 
+#Além disso, o código deve avaliar se o material da ordem de manutenção do ano seguinte e as históricas é a mesma, indicando se houve alguma troca de fornecedor e há necessidade de delistar algum material.
