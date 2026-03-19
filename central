@@ -1,0 +1,521 @@
+"""
+agente_mro.py — Avaliação de itens críticos zerados (MRO) com ferramentas e Agent.
+
+Requisitos:
+  pip install requests python-dotenv pydantic-ai
+
+Env (.env):
+  OPENROUTER_API_KEY=seu_token
+  USE_MOCK=1                      # 1 para usar dados mock; 0 para usar APIs reais
+  ERP_BASE_URL=https://seu-erp.exemplo
+  CMMS_URL=https://seu-cmms.exemplo
+  MDM_URL=https://seu-mdm.exemplo
+  BUY_URL=https://seu-portal-compras.exemplo
+
+Como executar:
+  python agente_mro.py
+"""
+
+import os
+import json
+import requests
+from datetime import datetime, timedelta
+from typing import List
+
+from dotenv import load_dotenv
+from pydantic_ai import Agent
+from pydantic_ai.models.openrouter import OpenRouterModel
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuração
+# ─────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+HEADERS = {"User-Agent": "AulaAgentes/1.0 (aula didatica)"}
+USE_MOCK = os.getenv("USE_MOCK", "1") == "1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramenta de exemplo (Wikipedia) — do seu código original
+# ─────────────────────────────────────────────────────────────────────────────
+def pesquisar_wikipedia(termo: str) -> str:
+    """
+    Pesquisa informações sobre um tema na Wikipedia em português.
+    Use quando precisar de informações factuais sobre qualquer assunto.
+    Pode ser chamada múltiplas vezes para temas diferentes.
+    Retorna string com um pequeno resumo.
+    """
+    try:
+        busca = requests.get(
+            "https://pt.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search",
+                    "srsearch": termo, "format": "json", "srlimit": 1},
+            timeout=5, headers=HEADERS,
+        )
+        resultados = busca.json().get("query", {}).get("search", [])
+        if not resultados:
+            return f"Não encontrei nada sobre '{termo}'."
+
+        titulo = resultados[0]["title"]
+        resumo = requests.get(
+            f"https://pt.wikipedia.org/api/rest_v1/page/summary/{titulo.replace(' ', '_')}",
+            timeout=5, headers=HEADERS,
+        )
+        texto = resumo.json().get("extract", "Sem resumo.") if resumo.status_code == 200 else "Não encontrado."
+        return f"[Artigo: {titulo}]\n{texto}"
+    except Exception as e:
+        return f"Erro: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramentas MRO — consultas de dados (estoque, demanda, lead time)
+# ─────────────────────────────────────────────────────────────────────────────
+def consultar_estoque_item(codigo_item: str) -> str:
+    """
+    Consulta o saldo do item no ERP/CMMS.
+    Use quando precisar saber estoque atual, reservado, em trânsito e depósitos.
+    Retorna JSON serializado com {estoque_atual, reservado, em_transito, locais, descricao, unidade}.
+    """
+    try:
+        if not USE_MOCK:
+            resp = requests.get(
+                f"{os.getenv('ERP_BASE_URL')}/estoque/{codigo_item}",
+                timeout=5, headers=HEADERS
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock para POC/Demo
+            data = {
+                "codigo_item": codigo_item,
+                "descricao": "ROLAMENTO 6204-2RS" if "6204" in codigo_item else f"ITEM {codigo_item}",
+                "estoque_atual": 0,
+                "reservado": 2 if "6204" in codigo_item else 0,
+                "em_transito": 0,
+                "locais": ["ALM-01", "LINHA-A"],
+                "unidade": "UN"
+            }
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao consultar estoque: {e}"}, ensure_ascii=False)
+
+
+def consultar_demanda_manutencao(codigo_item: str, janela_dias: int = 30) -> str:
+    """
+    Consulta a demanda prevista de manutenção para o item em uma janela de dias.
+    Use para obter consumo médio diário e intervenções agendadas (data e quantidade).
+    Retorna JSON: {consumo_medio_dia, manutencoes_agendadas: [{data, qtd, ordem}]}.
+    """
+    try:
+        hoje = datetime.now().date()
+        if not USE_MOCK:
+            resp = requests.get(
+                f"{os.getenv('CMMS_URL')}/demanda/{codigo_item}",
+                params={"dias": janela_dias},
+                timeout=5, headers=HEADERS
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock
+            data = {
+                "codigo_item": codigo_item,
+                "consumo_medio_dia": 0.7 if "6204" in codigo_item else 0.3,
+                "manutencoes_agendadas": [
+                    {"data": str(hoje + timedelta(days=3)), "qtd": 2, "ordem": "WO-12345"},
+                    {"data": str(hoje + timedelta(days=12)), "qtd": 1, "ordem": "WO-12387"},
+                ]
+            }
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao consultar demanda: {e}"}, ensure_ascii=False)
+
+
+def consultar_lead_time_fornecedor(codigo_item: str) -> str:
+    """
+    Obtém lead time, fornecedor preferencial, lote mínimo e múltiplo de compra.
+    Use para calcular data-limite e quantidade sugerida.
+    Retorna JSON: {lead_time_dias, fornecedor, lote_minimo, multiplo_lote}.
+    """
+    try:
+        if not USE_MOCK:
+            resp = requests.get(
+                f"{os.getenv('MDM_URL')}/itens/{codigo_item}/compras",
+                timeout=5, headers=HEADERS
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock
+            data = {
+                "codigo_item": codigo_item,
+                "fornecedor": "ACME SUPRIMENTOS",
+                "lead_time_dias": 10 if "6204" in codigo_item else 7,
+                "lote_minimo": 5,
+                "multiplo_lote": 5
+            }
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao consultar lead time: {e}"}, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramentas MRO — cálculo de data-limite e quantidade sugerida
+# ─────────────────────────────────────────────────────────────────────────────
+def calcular_data_limite_pedido(
+    data_necessidade: str,
+    lead_time_dias: int,
+    dias_buffer: int = 0
+) -> str:
+    """
+    Calcula a data-limite para emissão da OC, dado quando a peça é necessária.
+    Use após conhecer o lead time e a data da necessidade (manutenção/ruptura prevista).
+    Retorna JSON: {data_limite, status} onde status pode ser "OK" ou "ATRASADO".
+    """
+    try:
+        alvo = datetime.strptime(data_necessidade, "%Y-%m-%d").date()
+        hoje = datetime.now().date()
+        data_limite = alvo - timedelta(days=lead_time_dias + dias_buffer)
+        status = "OK" if data_limite >= hoje else "ATRASADO"
+        return json.dumps({
+            "data_necessidade": str(alvo),
+            "lead_time_dias": lead_time_dias,
+            "dias_buffer": dias_buffer,
+            "data_limite": str(data_limite),
+            "status": status
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao calcular data-limite: {e}"}, ensure_ascii=False)
+
+
+def sugerir_quantidade_compra(
+    consumo_medio_dia: float,
+    lead_time_dias: int,
+    estoque_atual: float,
+    estoque_seguranca_dias: int = 3,
+    horizonte_reabastecimento_dias: int = 30,
+    lote_minimo: int = 1,
+    multiplo_lote: int = 1
+) -> str:
+    """
+    Sugere quantidade de compra baseada em:
+    - consumo médio/dia
+    - lead time (dias)
+    - estoque atual
+    - estoque de segurança (dias)
+    - horizonte de cobertura (janela que você quer cobrir além do lead time)
+    - lote mínimo e múltiplo de compra
+
+    Fórmula base:
+      necessidade = consumo_medio_dia * (lead_time + estoque_seguranca + horizonte) - estoque_atual
+      quantidade_sugerida = arredondada para cima ao múltiplo de compra e >= lote mínimo
+
+    Retorna JSON: {quantidade_sugerida, necessidade_bruta, parametros}.
+    """
+    try:
+        necessidade_bruta = (
+            consumo_medio_dia * (lead_time_dias + estoque_seguranca_dias + horizonte_reabastecimento_dias)
+            - estoque_atual
+        )
+        necessidade_bruta = max(0, necessidade_bruta)
+
+        # Ajuste para múltiplos de compra (arredondamento para cima)
+        if multiplo_lote and multiplo_lote > 1:
+            import math
+            quantidade = math.ceil(necessidade_bruta / multiplo_lote) * multiplo_lote
+        else:
+            quantidade = int(round(necessidade_bruta))
+
+        if quantidade < lote_minimo:
+            quantidade = lote_minimo
+
+        return json.dumps({
+            "quantidade_sugerida": int(quantidade),
+            "necessidade_bruta": float(round(necessidade_bruta, 2)),
+            "parametros": {
+                "consumo_medio_dia": consumo_medio_dia,
+                "lead_time_dias": lead_time_dias,
+                "estoque_atual": estoque_atual,
+                "estoque_seguranca_dias": estoque_seguranca_dias,
+                "horizonte_reabastecimento_dias": horizonte_reabastecimento_dias,
+                "lote_minimo": lote_minimo,
+                "multiplo_lote": multiplo_lote
+            }
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao sugerir quantidade: {e}"}, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramentas MRO — substitutos e disponibilidade
+# ─────────────────────────────────────────────────────────────────────────────
+def buscar_substitutos(codigo_item: str) -> str:
+    """
+    Busca itens substitutos aprovados/validados em engenharia/qualidade.
+    Use quando o item estiver zerado e houver risco de parada.
+    Retorna JSON: {substitutos: [{codigo, fornecedor, observacoes}]}.
+    """
+    try:
+        if not USE_MOCK:
+            resp = requests.get(
+                f"{os.getenv('MDM_URL')}/substitutos/{codigo_item}",
+                timeout=5, headers=HEADERS
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock
+            data = {
+                "codigo_item": codigo_item,
+                "substitutos": [
+                    {"codigo": "6204-2Z", "fornecedor": "SKF", "observacoes": "Vedação metálica, avaliar aplicação"},
+                    {"codigo": "6204-2RS-C3", "fornecedor": "FAG", "observacoes": "Folga C3. Confirmar com Eng."}
+                ]
+            }
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao buscar substitutos: {e}"}, ensure_ascii=False)
+
+
+def consultar_preco_e_disponibilidade(codigo_item: str, fornecedor: str = "") -> str:
+    """
+    Consulta preço e disponibilidade em fornecedores homologados.
+    Use para comparar alternativas e encurtar tempo de reposição.
+    Retorna JSON: {ofertas: [{fornecedor, preco, disponibilidade_dias, observacoes}]}.
+    """
+    try:
+        if not USE_MOCK:
+            resp = requests.get(
+                f"{os.getenv('BUY_URL')}/cotacao",
+                params={"item": codigo_item, "fornecedor": fornecedor},
+                timeout=5, headers=HEADERS
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock
+            data = {
+                "codigo_item": codigo_item,
+                "ofertas": [
+                    {"fornecedor": "ACME SUPRIMENTOS", "preco": 35.9, "disponibilidade_dias": 10, "observacoes": ""},
+                    {"fornecedor": "MEGAPARTS", "preco": 38.5, "disponibilidade_dias": 5, "observacoes": "Entrega expressa"},
+                ]
+            }
+            if fornecedor:
+                data["ofertas"] = [o for o in data["ofertas"] if o["fornecedor"] == fornecedor]
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao consultar ofertas: {e}"}, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramentas MRO — geração de OC e notificação
+# ─────────────────────────────────────────────────────────────────────────────
+def gerar_ordem_compra(
+    codigo_item: str,
+    quantidade: int,
+    fornecedor: str,
+    data_entrega_desejada: str
+) -> str:
+    """
+    Gera uma Ordem de Compra no ERP (ou devolve um rascunho).
+    Use quando já tiver quantidade, fornecedor e data-alvo.
+    Retorna JSON: {oc_numero, status, mensagem}.
+    """
+    try:
+        if not USE_MOCK:
+            payload = {
+                "item": codigo_item,
+                "quantidade": quantidade,
+                "fornecedor": fornecedor,
+                "data_entrega": data_entrega_desejada,
+            }
+            resp = requests.post(
+                f"{os.getenv('ERP_BASE_URL')}/oc",
+                json=payload, headers=HEADERS, timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            # Mock
+            data = {
+                "oc_numero": f"OC-{datetime.now().year}-000123",
+                "status": "CRIADA",
+                "mensagem": f"OC criada para {codigo_item}, {quantidade} UN, fornecedor {fornecedor}, entrega {data_entrega_desejada}."
+            }
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha ao gerar OC: {e}"}, ensure_ascii=False)
+
+
+def notificar_compras(email_responsavel: str, resumo: str) -> str:
+    """
+    Envia uma notificação (e-mail/Teams) ao comprador/planner responsável.
+    Use após gerar recomendação ou OC.
+    Retorna string simples confirmando envio.
+    """
+    try:
+        # Integração real (ex.: Microsoft Graph / Teams webhook) pode ser implementada aqui.
+        return f"Notificação enviada para {email_responsavel}: {resumo[:200]}..."
+    except Exception as e:
+        return f"Erro ao notificar: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ferramenta “orquestradora” — avaliação de itens críticos zerados
+# ─────────────────────────────────────────────────────────────────────────────
+def avaliar_itens_criticos_zerados(itens: List[str]) -> str:
+    """
+    Avalia uma lista de itens críticos zerados em estoque e retorna um plano de ação.
+    Para cada item:
+      - consulta estoque, demanda (manutenções) e lead time;
+      - encontra a próxima data de necessidade;
+      - calcula data-limite de emissão da OC;
+      - sugere quantidade de compra;
+      - indica urgência.
+
+    Retorna JSON: {itens: [{codigo_item, descricao, estoque_atual, proxima_necessidade, data_limite, status, quantidade_sugerida, fornecedor}]}.
+    """
+    try:
+        hoje = datetime.now().date()
+        resultado = []
+
+        for codigo in itens:
+            est = json.loads(consultar_estoque_item(codigo))
+            dem = json.loads(consultar_demanda_manutencao(codigo))
+            lt = json.loads(consultar_lead_time_fornecedor(codigo))
+
+            if "erro" in est or "erro" in dem or "erro" in lt:
+                resultado.append({
+                    "codigo_item": codigo,
+                    "erro": f"Falha em uma das consultas: estoque={est.get('erro')}, demanda={dem.get('erro')}, lead_time={lt.get('erro')}"
+                })
+                continue
+
+            estoque_atual = est.get("estoque_atual", 0)
+            manutencoes = dem.get("manutencoes_agendadas", [])
+            consumo_dia = dem.get("consumo_medio_dia", 0.0)
+            lead_time = lt.get("lead_time_dias", 0)
+            fornecedor = lt.get("fornecedor", "")
+
+            # Próxima necessidade: menor data entre as agendadas ou imediata se consumo > 0 e estoque = 0
+            if manutencoes:
+                proxima = min(datetime.strptime(m["data"], "%Y-%m-%d").date() for m in manutencoes)
+            else:
+                proxima = hoje if (estoque_atual <= 0 and consumo_dia > 0) else (hoje + timedelta(days=lead_time))
+
+            # Data-limite
+            limite = json.loads(calcular_data_limite_pedido(str(proxima), lead_time, dias_buffer=0))
+            status = limite.get("status", "DESCONHECIDO")
+
+            # Quantidade sugerida (cobrir LT + 30 dias + 3 de segurança)
+            sugestao = json.loads(sugerir_quantidade_compra(
+                consumo_medio_dia=consumo_dia,
+                lead_time_dias=lead_time,
+                estoque_atual=estoque_atual,
+                estoque_seguranca_dias=3,
+                horizonte_reabastecimento_dias=30,
+                lote_minimo=lt.get("lote_minimo", 1),
+                multiplo_lote=lt.get("multiplo_lote", 1),
+            ))
+
+            resultado.append({
+                "codigo_item": codigo,
+                "descricao": est.get("descricao", ""),
+                "estoque_atual": estoque_atual,
+                "proxima_necessidade": limite.get("data_necessidade"),
+                "data_limite": limite.get("data_limite"),
+                "status": status,  # "ATRASADO" => emitir OC imediato
+                "quantidade_sugerida": sugestao.get("quantidade_sugerida"),
+                "fornecedor": fornecedor
+            })
+
+        # Ordenação: ATRASADO primeiro; depois por data_limite crescente
+        resultado.sort(key=lambda x: (x.get("status") != "ATRASADO", x.get("data_limite", "9999-12-31")))
+        return json.dumps({"itens": resultado}, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"erro": f"Falha na avaliação: {e}"}, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuração do Agent (LLM) com as ferramentas
+# ─────────────────────────────────────────────────────────────────────────────
+def build_agent():
+    """
+    Cria e retorna um Agent configurado para priorizar itens críticos MRO.
+    Requer variável OPENROUTER_API_KEY no ambiente.
+    """
+    model_name = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    modelo = OpenRouterModel(model_name)
+
+    agente_mro = Agent(
+        model=modelo,
+        tools=[
+            # Ferramenta original (exemplo)
+            pesquisar_wikipedia,
+
+            # Ferramentas MRO
+            consultar_estoque_item,
+            consultar_demanda_manutencao,
+            consultar_lead_time_fornecedor,
+            calcular_data_limite_pedido,
+            sugerir_quantidade_compra,
+            buscar_substitutos,
+            consultar_preco_e_disponibilidade,
+            gerar_ordem_compra,
+            notificar_compras,
+            avaliar_itens_criticos_zerados,
+        ],
+        system_prompt=(
+            "Você é um planejador de materiais (MRO). "
+            "Sempre consulte as ferramentas antes de responder. "
+            "Priorize itens críticos com estoque zerado e risco de parada. "
+            "Calcule data-limite do pedido e quantidade sugerida; apresente substitutos e fornecedores, "
+            "sinalizando urgência e se há atraso para emitir OC imediata."
+        ),
+    )
+    return agente_mro
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exemplos de execução
+# ─────────────────────────────────────────────────────────────────────────────
+def exemplo_execucao_direta():
+    """Executa a avaliação direta (sem LLM) sobre uma lista de itens críticos."""
+    itens = ["6204-2RS", "VL-1200", "CORREIA-A13"]
+    print("▶ Avaliando itens críticos zerados (execução direta, sem LLM)...")
+    resultado = avaliar_itens_criticos_zerados(itens)
+    print(resultado)
+
+
+def exemplo_execucao_via_agent():
+    """Executa a avaliação via Agent (LLM chamará as ferramentas conforme necessário)."""
+    print("\n▶ Avaliando via Agent (LLM + ferramentas)...")
+    agente = build_agent()
+    pergunta = (
+        "Quais itens críticos zerados hoje precisam de OC imediata? "
+        "Considere os códigos: ['6204-2RS', 'VL-1200', 'CORREIA-A13']. "
+        "Para cada um, me dê status (OK/ATRASADO), data-limite e quantidade sugerida. "
+        "Se houver atraso, sugira substitutos e o menor prazo disponível entre fornecedores."
+    )
+    r = agente.run_sync(pergunta)
+    print(r.output)
+    try:
+        print(f"\nChamadas à API do modelo: {r.usage().requests}")
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # 1) Execução direta (determinística com os mocks)
+    exemplo_execucao_direta()
+
+    # 2) Execução via Agent (requer OPENROUTER_API_KEY)
+    if os.getenv("OPENROUTER_API_KEY"):
+        exemplo_execucao_via_agent()
+    else:
+        print("\n[AVISO] OPENROUTER_API_KEY não encontrado no ambiente. "
+              "Pulei a execução via Agent. Defina no seu .env para habilitar.")
